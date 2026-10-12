@@ -1,0 +1,86 @@
+name: Container CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build image once
+        run: docker build --tag lab6-api:$GITHUB_SHA .
+
+      - name: Test the same image with two configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for environment in Development Production; do
+            container="lab6-${environment,,}"
+            greeting="Hello from ${environment} configuration."
+
+            docker run --detach \
+              --name "$container" \
+              --publish 127.0.0.1:8080:8080 \
+              --env DOTNET_ENVIRONMENT="$environment" \
+              --env App__Greeting="$greeting" \
+              --env APP_VERSION="$GITHUB_SHA" \
+              lab6-api:"$GITHUB_SHA"
+
+            ready=false
+            for attempt in {1..30}; do
+              if curl --fail --silent --max-time 2 \
+                http://localhost:8080/health > /dev/null; then
+                ready=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$ready" != "true" ]; then
+              echo "$environment container did not become healthy."
+              exit 1
+            fi
+
+            curl --fail --silent --show-error --max-time 5 \
+              http://localhost:8080/ > response.json
+
+            cat response.json
+
+            jq --exit-status \
+              --arg environment "$environment" \
+              --arg greeting "$greeting" \
+              --arg version "$GITHUB_SHA" \
+              '.environment == $environment
+               and .message == $greeting
+               and .version == $version' response.json
+
+            echo "$environment configuration passed."
+            docker logs "$container"
+            docker rm --force "$container"
+          done
+
+      - name: Show logs and clean up remaining containers
+        if: always()
+        shell: bash
+        run: |
+          for container in lab6-development lab6-production; do
+            if docker inspect "$container" > /dev/null 2>&1; then
+              docker logs "$container"
+              docker rm --force "$container"
+            fi
+          done
