@@ -15,6 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -73,6 +77,33 @@ jobs:
             docker logs "$container"
             docker rm --force "$container"
           done
+
+      - name: Sign in to Azure for publishing
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: azure/login@8c334a195cbb38e46038007b304988d888bf676a
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push tested image to ACR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          set -euo pipefail
+
+          az acr login --name "$ACR_NAME"
+
+          image="$ACR_LOGIN_SERVER/lab6-api:$GITHUB_SHA"
+
+          docker tag "lab6-api:$GITHUB_SHA" "$image"
+
+          docker push "$image"
+
+          echo "Published image: $image"
 
       - name: Show logs and clean up remaining containers
         if: always()
