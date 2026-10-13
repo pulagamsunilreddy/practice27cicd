@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab6-api-config
+  namespace: lab-dev
+data:
+  DOTNET_ENVIRONMENT: "Development"
+  App__Greeting: "Hello from DEV on AKS."
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab6-api
+  namespace: lab-dev
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: lab6-api
+
+  template:
+    metadata:
+      labels:
+        app: lab6-api
+
+    spec:
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: lab6-api
+
+      containers:
+        - name: api
+          image: acrpractice27sunil22168.azurecr.io/lab6-api:b8d67c71297aaa4bd9a4f69c35753ff82e6c08ed
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          envFrom:
+            - configMapRef:
+                name: lab6-api-config
+
+          env:
+            - name: APP_VERSION
+              value: "b8d67c71297aaa4bd9a4f69c35753ff82e6c08ed"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab6-api
+  namespace: lab-dev
+spec:
+  type: ClusterIP
+
+  selector:
+    app: lab6-api
+
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

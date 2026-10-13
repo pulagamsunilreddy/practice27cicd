@@ -1,4 +1,4 @@
-name: Container CI
+name: Container CI/CD
 
 on:
   push:
@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: container-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -18,6 +22,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+    outputs:
+      image_ref: ${{ steps.publish.outputs.image_ref }}
 
     steps:
       - name: Check out source
@@ -87,6 +94,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Push tested image to ACR
+        id: publish
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         shell: bash
         env:
@@ -98,12 +106,21 @@ jobs:
           az acr login --name "$ACR_NAME"
 
           image="$ACR_LOGIN_SERVER/lab6-api:$GITHUB_SHA"
-
           docker tag "lab6-api:$GITHUB_SHA" "$image"
-
           docker push "$image"
 
-          echo "Published image: $image"
+          image_ref=$(docker image inspect "$image" \
+            --format '{{index .RepoDigests 0}}')
+
+          expected_prefix="$ACR_LOGIN_SERVER/lab6-api@sha256:"
+
+          if [[ "$image_ref" != "$expected_prefix"* ]]; then
+            echo "Could not obtain the expected registry image digest."
+            exit 1
+          fi
+
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
+          echo "Published image: $image_ref"
 
       - name: Show logs and clean up remaining containers
         if: always()
@@ -115,3 +132,183 @@ jobs:
               docker rm --force "$container"
             fi
           done
+
+  deploy-dev:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      IMAGE_REF: ${{ needs.build-and-test.outputs.image_ref }}
+
+    steps:
+      - name: Check out deployment files
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Sign in with the dev deployment identity
+        uses: azure/login@8c334a195cbb38e46038007b304988d888bf676a
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install matching kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.35.8'
+
+      - name: Install kubelogin
+        uses: azure/use-kubelogin@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          kubelogin-version: 'latest'
+
+      - name: Connect to AKS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az aks get-credentials \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --overwrite-existing
+
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Prepare deployment with the published digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f k8s/dev.yml
+          test -n "$IMAGE_REF"
+
+          image_digest="${IMAGE_REF##*@}"
+
+          if [[ ! "$image_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Invalid image digest."
+            exit 1
+          fi
+
+          deploy_dir="$RUNNER_TEMP/lab6-dev"
+          mkdir -p "$deploy_dir"
+          cp k8s/dev.yml "$deploy_dir/dev.yml"
+
+          cat > "$deploy_dir/kustomization.yaml" <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: $K8S_NAMESPACE
+          resources:
+            - dev.yml
+          images:
+            - name: $ACR_LOGIN_SERVER/lab6-api
+              newName: $ACR_LOGIN_SERVER/lab6-api
+              digest: $image_digest
+          patches:
+            - target:
+                group: apps
+                version: v1
+                kind: Deployment
+                name: lab6-api
+              patch: |-
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: lab6-api
+                spec:
+                  template:
+                    spec:
+                      containers:
+                        - name: api
+                          env:
+                            - name: APP_VERSION
+                              value: "$GITHUB_SHA"
+          EOF
+
+          kubectl kustomize "$deploy_dir" \
+            > "$RUNNER_TEMP/lab6-dev-rendered.yml"
+
+      - name: Apply configuration and wait for rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -n "$K8S_NAMESPACE" \
+            -f "$RUNNER_TEMP/lab6-dev-rendered.yml"
+
+          kubectl rollout status deployment/lab6-api \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+      - name: Verify the deployed application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deployed_image=$(kubectl get deployment lab6-api \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          if [ "$deployed_image" != "$IMAGE_REF" ]; then
+            echo "Deployment image does not match the published digest."
+            exit 1
+          fi
+
+          kubectl port-forward service/lab6-api \
+            5081:80 \
+            -n "$K8S_NAMESPACE" \
+            > "$RUNNER_TEMP/port-forward.log" 2>&1 &
+
+          forward_pid=$!
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --max-time 2 \
+              http://localhost:5081/health > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$ready" != "true" ]; then
+            cat "$RUNNER_TEMP/port-forward.log"
+            echo "Deployed application health check failed."
+            exit 1
+          fi
+
+          curl --fail --silent --show-error --max-time 5 \
+            http://localhost:5081/ > deployed-response.json
+
+          cat deployed-response.json
+
+          jq --exit-status \
+            --arg version "$GITHUB_SHA" \
+            '.environment == "Development"
+             and .version == $version' deployed-response.json
+
+          echo "Dev deployment and smoke test passed."
+
+      - name: Show diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          kubectl get pods -n "$K8S_NAMESPACE" -o wide || true
+          kubectl describe deployment lab6-api -n "$K8S_NAMESPACE" || true
+          kubectl get events -n "$K8S_NAMESPACE" \
+            --sort-by=.metadata.creationTimestamp || true
