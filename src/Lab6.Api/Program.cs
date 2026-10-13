@@ -42,7 +42,7 @@ app.MapGet("/", (ILogger<Program> logger) =>
 
     return Results.Ok(new
     {
-        application = "Lab 6 CI/CD API - Update 2",
+        application = "Lab 6 CI/CD API",
         message = app.Configuration["App:Greeting"],
         environment = app.Environment.EnvironmentName,
         version = release
